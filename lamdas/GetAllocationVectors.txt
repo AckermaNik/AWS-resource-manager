@@ -1,0 +1,49 @@
+import json
+import boto3
+import os
+import traceback
+from datetime import datetime
+from decimal import Decimal
+
+dynamodb = boto3.resource('dynamodb', region_name=os.getenv('AWS_REGION', 'us-east-1'))
+table = dynamodb.Table(os.environ['AWS_DYNAMODB_TABLE'])
+
+def to_decimal(x):
+    return Decimal(str(x)) 
+
+def lambda_handler(event, context):
+
+    try:
+        for record in event['Records']:
+            body = json.loads(record['body'])
+            print(body)
+            user_id = body['user_id']
+            matrix = body['matrix']
+            round_id = body['round']
+            t_hat = body['t_hat']
+
+            
+            # timestamp for a backup
+            timestamp = datetime.utcnow().isoformat()
+            table.put_item(
+                Item={
+                    'user_id': str(user_id),
+                    'round_id': int(round_id),
+                    'matrix': matrix,
+                    't_hat': [[to_decimal(x) for x in row] for row in t_hat] ,
+                    'timestamp': timestamp
+                }
+            )
+            print(f"Stored matrix for user {user_id}, round {round_id}")
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Messages stored in DynamoDB')
+        }
+    except Exception as e:
+        print("DynamoDB put_item failed")
+        print(e)
+        print(traceback.format_exc())
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
+        }

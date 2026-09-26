@@ -1,0 +1,116 @@
+import boto3
+import time
+import os
+from botocore.exceptions import ClientError
+import urllib3
+import json
+
+http = urllib3.PoolManager()
+
+dynamodb = boto3.resource('dynamodb', region_name=os.getenv('AWS_REGION', 'us-east-1'))
+table = dynamodb.Table(os.environ['AWS_DYNAMODB_TABLE'])
+
+RESOURCE_MANAGER_URL = os.environ['RESOURCE_MANAGER_URL']
+USERS = [0, 1, 2]
+
+def decimal_to_float(matrix):
+    return [[float(x) for x in row] for row in matrix]
+
+def decimal_to_int(matrix):
+    return [int(x) for x in matrix]
+
+
+def lambda_handler(event, context):
+
+    try:
+        record = event['Records'][0]
+
+        if record['eventName'] != 'INSERT':
+            return
+
+        
+        round_id = int(record['dynamodb']['NewImage']['round_id']['N'])
+
+        #try to acquire the row lock (AGGREGATE row)
+        try:
+            table.put_item(
+                Item={
+                    'user_id': 'AGGREGATE',
+                    'round_id': round_id,
+                    'done': False
+                },
+                ConditionExpression="attribute_not_exists(user_id)"
+            )
+        except ClientError as e:
+            # another Lambda already locked or processed this round
+            if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                print(f"Round {round_id} already locked/processed")
+                return
+            raise  #re-raise the exception if not ClientError and fail
+
+        #check if all users have submitted their matrix
+        while True:
+            not_ready=False
+            submitted_matrices = []
+            t_hat = None
+            for user_id in USERS:
+                response = table.get_item(
+                    Key={
+                        'user_id': str(user_id),
+                        'round_id': round_id
+                    }
+                )
+
+                if 'Item' not in response:
+                    print(f"Round {round_id} not ready yet")
+                    not_ready=True
+                    time.sleep(1)
+                    break
+
+                submitted_matrices.append({
+                    "user_id": int(user_id),
+                    "matrix": decimal_to_int(response['Item']['matrix'])
+                })
+
+                print(f"User {user_id} submitted matrix: {submitted_matrices}")
+
+                if t_hat is None:
+                    t_hat = decimal_to_float(response['Item']['t_hat'])
+                    print(f"t_hat: {t_hat}")
+
+            if not_ready == False:
+                break
+
+        payload = {
+            'round': round_id,
+            'matrix': submitted_matrices,
+            't_hat': t_hat
+        }
+
+        try:
+            payload = json.dumps(payload).encode("utf-8")
+            r = http.request(
+                "POST",
+                RESOURCE_MANAGER_URL,
+                body=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=5.0
+            )
+
+            print(f"Round {round_id} sent successfully: {r.status}")
+        except Exception as e:
+            print(f"Failed to send round {round_id}: {e}")
+            raise
+
+        # mark round as processed
+        table.update_item(
+            Key={'user_id': 'AGGREGATE', 'round_id': round_id},
+            UpdateExpression="SET done = :val",
+            ExpressionAttributeValues={':val': True}
+        )
+    except Exception as e:
+        print(e)
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
+        }
